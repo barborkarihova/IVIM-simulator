@@ -226,7 +226,7 @@ class IVIMSimulator:
 
         def perf_only(b, D_star):
             return f_final * np.exp(-b * D_star)
-        popt, _ = curve_fit(perf_only, b_low, s_perf_low, p0=[0.02], bounds=(0.001, 0.5))
+        popt, _ = curve_fit(perf_only, b_low, s_perf_low, p0=[0.01], bounds=(0.001, 0.5))
         D_star_final = popt[0]
         return f_final, D_final, D_star_final
 
