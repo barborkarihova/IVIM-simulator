@@ -318,6 +318,9 @@ class IVIMSimulator:
         if self.vessel_net.data['fa'] is None:
             raise ValueError("Vessel network does not have FA calculated. Please run orientational_analysis() on the vessel network first.")
         fa_f, md_f = self._get_fa_md(self.f_tensor)
+        print("=" * 40)
+        print("F TENSOR EVALUATION")
+        print("=" * 40)
         print("Fractional anisotropy of f tensor:", fa_f)
         print("Reference fractional anisotropy:", self.vessel_net.data['fa'])
         print("Mean diffusivity of f tensor:", md_f)
