@@ -10,7 +10,7 @@ The project was developed using Python 3.12. All required dependencies are state
 * **Hydrodynamics:** Calculation of blood flow and velocity from a vascular network model
 * **Trajectories:** Generation of perfusing (intravascular) and diffusing (extravascular) particle trajectories
 * **Signal Simulation:** IVIM MRI signal generation based on simulated trajectories
-* **Tensor Extraction:** Fitting and extraction of resulting IVIM tensors (f, D*, D)
+* **Tensor Extraction:** Fitting of IVIM parameters (f, D, D*) and construction of the resulting IVIM tensors
 
 
 
