@@ -1,15 +1,15 @@
 import numpy as np
-from scripts.network import VesselNetwork
-from scripts.trajectories_utils import get_particle_path
+from .network import VesselNetwork
+from .trajectories_utils import get_particle_path
 from dipy.core.gradients import gradient_table
 import dipy.reconst.dti as dti
 from scipy.optimize import curve_fit
-from scripts.visualize import plot_ivim_tensors
+from .visualize import plot_ivim_tensors
 
 class IVIMSimulator:
     """Simulates IVIM MRI signal based on particle trajectories through a vascular network and diffusion in the extravascular space."""
-    def __init__(self, vessel_net: VesselNetwork, diffusion_time=100e-3, delta_t=1e-4, 
-                 grad_dur=25e-3, pixel_size=1e-6, D_input=1000):
+    def __init__(self, vessel_net: VesselNetwork = None, diffusion_time=100e-3, delta_t=1e-4, 
+                 grad_dur=25e-3, pixel_size=1e-6, D_input=1000, b_threshold=175):
         """
         Parameters:
             vessel_net (VesselNetwork): An instance of the VesselNetwork class containing the vascular graph and flow information
@@ -20,7 +20,7 @@ class IVIMSimulator:
             D_input (float or array_like): Diffusion coefficient for the extravascular space. Can be a single scalar for isotropic diffusion, or a 3x3 array for an anisotropic diffusion tensor (default: 1000 mm^2/s)
         """
         # Check if vessel net has flows
-        if not vessel_net.data.get('flow_calculated', False):
+        if vessel_net is not None and not vessel_net.data.get('flow_calculated', False):
             raise ValueError("Vessel network must have flow calculated to simulate perfusion.")
         self.vessel_net = vessel_net
         self.diffusion_time = diffusion_time
@@ -28,6 +28,7 @@ class IVIMSimulator:
         self.grad_dur = grad_dur
         self.pixel_size = pixel_size
         self.D_input = D_input
+        self.b_threshold = b_threshold
 
         self.gamma = 42.58e6 * 2 * np.pi
         self.simulation_time = self.diffusion_time + self.grad_dur
@@ -37,7 +38,6 @@ class IVIMSimulator:
         self.ivim_signal = None
         self.b_values = None
         self.gradient_directions = None
-        self.b_threshold = None
         self.f_tensor = None
         self.D_tensor = None
         self.D_star_tensor = None
@@ -73,6 +73,8 @@ class IVIMSimulator:
         Returns:
             trajectories (np.ndarray): An array of shape (n, n_steps, 3) containing the trajectories of the perfusing particles in pixel coordinates.
         """
+        if self.vessel_net is None:
+            raise ValueError("Perfusion simulation requires a vessel_net. Pass one when creating IVIMSimulator, or use generate_n_diffusing_particles() for diffusion-only simulation.")
         self.perfusion_trajectories = []
         min_pxs_vel = 20 # 20px/s = 0.02mm/s, leave out extremely slow trajectories, these artifacts can appear when calculating velocities
         while len(self.perfusion_trajectories) < n:
@@ -146,29 +148,68 @@ class IVIMSimulator:
             mean_signals.append(signal)
         return mean_signals
 
-    def get_ivim_signal(self, n_perfusion, n_diffusion, b_values, gradient_directions, out_file = None):
+    def compute_signal_from_trajectories(self, trajectories, b_values, gradient_directions, out_file=None, extra_params=None):
         """
-        Generates particle trajectories and calculates the full IVIM MRI signal.
+        Calculates the full IVIM MRI signal from given particle trajectories.
 
         Parameters:
-            n_perfusion (int): Number of perfusing particles to simulate within the vascular network.
-            n_diffusion (int): Number of diffusing particles to simulate in the extravascular space.
+            trajectories (np.ndarray): Array of shape (n_particles, n_steps, 3) with particle
+                positions in pixel coordinates. Can come from any source (own generator,
+                generate_n_diffusing_particles, generate_n_perfusing_particles, concatenation of both, ...).
             b_values (array_like): A list or 1D numpy array of b-values (in s/mm^2) for the sequence.
-            gradient_directions (array_like): A 1D array (for a single direction) or 2D array (for multiple directions) representing the gradient vectors [x, y, z]. These are automatically normalized.
-            out_file (str, optional): Path to a .npz file where the computed signals, parameters, and setup details will be saved. Default is None (no saving).
+            gradient_directions (array_like): A 1D array (for a single direction) or 2D array (for
+                multiple directions) representing the gradient vectors [x, y, z]. Automatically normalized.
+            out_file (str, optional): Path to a .npz file for saving results. Default is None.
+            extra_params (dict, optional): Extra metadata to store alongside the standard params
+                when saving (e.g. n_particles, source of trajectories, ...).
 
         Returns:
-            signals (np.ndarray): A list containing the computed signal arrays. Each element in the list 
-            corresponds to one gradient direction and contains the signal values 
-            matching the sequence of requested b-values.
+            signals (np.ndarray): Array of shape (n_directions, n_b_values) with the computed signal.
         """
-        self.b_values = b_values
-        self.gradient_directions = gradient_directions
+        self.b_values = np.asarray(b_values)
+        self.gradient_directions = np.array(gradient_directions)
+        if len(self.gradient_directions.shape) == 1:
+            self.gradient_directions = self.gradient_directions.reshape(1, -1)
+        self.gradient_directions = self.gradient_directions / np.linalg.norm(self.gradient_directions, axis=1, keepdims=True)
 
+        mean_signals = []
+        for grad_dir in self.gradient_directions:
+            signals_for_dir = self.get_signal_one_direction(grad_dir, trajectories)
+            mean_signals.append(signals_for_dir)
+        all_signals_array = np.array(mean_signals)
+
+        if out_file is not None:
+            print(f"Saving signals to {out_file}...")
+            params = {
+                'simulation_time': self.simulation_time,
+                'diffusion_time': self.diffusion_time,
+                'D_input': self.D_input,
+                'delta_t': self.delta_t,
+                'grad_dur': self.grad_dur,
+            }
+            if extra_params is not None:
+                params.update(extra_params)
+            np.savez_compressed(
+                out_file,
+                signals=all_signals_array,
+                b_values=self.b_values,
+                directions=self.gradient_directions,
+                params=params
+            )
+
+        self.ivim_signal = all_signals_array
+        return all_signals_array
+
+
+    def get_ivim_signal(self, n_perfusion, n_diffusion, b_values, gradient_directions, out_file=None):
+        """
+        Generates particle trajectories (perfusing + diffusing) and calculates the full IVIM MRI signal.
+        See compute_signal_from_trajectories() if you already have your own trajectories.
+        """
         print("Generating particle trajectories - may take a few minutes...")
         self.generate_n_perfusing_particles(n_perfusion)
         self.generate_n_diffusing_particles(n_diffusion)
-        
+
         if len(self.perfusion_trajectories) > 0 and len(self.diffusion_trajectories) > 0:
             all_trajectories = np.concatenate((self.perfusion_trajectories, self.diffusion_trajectories), axis=0)
         elif len(self.perfusion_trajectories) > 0:
@@ -176,27 +217,9 @@ class IVIMSimulator:
         else:
             all_trajectories = self.diffusion_trajectories
 
-        self.gradient_directions = np.array(self.gradient_directions)
-        if len(self.gradient_directions.shape) == 1:
-            self.gradient_directions = self.gradient_directions.reshape(1, -1)
-        self.gradient_directions = self.gradient_directions / np.linalg.norm(self.gradient_directions, axis=1, keepdims=True)
-        mean_signals = []
-        for grad_dir in self.gradient_directions:
-            signals_for_dir = self.get_signal_one_direction(grad_dir, all_trajectories)
-            mean_signals.append(signals_for_dir)
-        all_signals_array = np.array(mean_signals)
-        if out_file is not None:
-            print(f"Saving signals to {out_file}...")
-            np.savez_compressed(
-            out_file, 
-            signals=all_signals_array, 
-            b_values=self.b_values, 
-            directions=self.gradient_directions,
-            params={'simulation_time': self.simulation_time, 'diffusion_time': self.diffusion_time, 'n_particles_perfusion': n_perfusion, 'n_particles_diffusion': n_diffusion, 'D_input': self.D_input, 'delta_t': self.delta_t, 'grad_dur': self.grad_dur}
-            )
-
-        self.ivim_signal = all_signals_array
-        return all_signals_array
+        extra_params = {'n_particles_perfusion': n_perfusion, 'n_particles_diffusion': n_diffusion}
+        return self.compute_signal_from_trajectories(all_trajectories, b_values, gradient_directions,
+                                                    out_file=out_file, extra_params=extra_params)
     
     #================================================================================
     # IVIM tensor extraction =========================================================
@@ -231,7 +254,7 @@ class IVIMSimulator:
         return f_final, D_final, D_star_final
 
 
-    def _get_parameter_arrays_scipy(self):
+    def get_parameter_arrays_scipy(self):
         """Fits the IVIM model to the signal for all gradient directions and returns arrays of f, D, and D* parameters."""
         f_list = []
         D_list = []
@@ -264,7 +287,7 @@ class IVIMSimulator:
         tensor_matrix = tenfit.quadratic_form 
         return tensor_matrix
 
-    def _get_fa_md(self, tensor_matrix):
+    def get_fa_md(self, tensor_matrix):
         """Calculate fractional anisotropy (FA) and mean eigenvalue from a tensor."""
         eigenvalues, eigenvectors = np.linalg.eigh(tensor_matrix)
         eigenvalues = np.sort(eigenvalues)[::-1]
@@ -278,12 +301,13 @@ class IVIMSimulator:
         md = (l1 + l2 + l3) / 3
         return fa, md
 
-    def fit_ivim_and_get_tensors(self, out_path=None, b_threshold=175):
+    def fit_ivim_and_get_tensors(self, out_path=None, b_threshold=None):
         """Fits the IVIM model to the simulated signal and extracts diffusion tensors for f, D, and D* parameters. Optionally saves the fitted tensors and their FA/MD values to a file."""
         if self.ivim_signal is None:
             raise ValueError("IVIM signal not calculated yet. Please run get_ivim_signal() first.")
-        self.b_threshold = b_threshold
-        f_array, D_array, D_star_array = self._get_parameter_arrays_scipy()
+        if b_threshold is not None:
+            self.b_threshold = b_threshold
+        f_array, D_array, D_star_array = self.get_parameter_arrays_scipy()
         # Calculate fake b values for tensor fitting based on the average parameter values, to ensure the signal is in a reasonable range for DTI fitting
         avg_f = np.mean(f_array)
         fake_b_f = 1.0 / avg_f
@@ -295,9 +319,9 @@ class IVIMSimulator:
         fake_b_d = 1.0 / avg_d
         D_tensor = self._get_tensor_from_param_arrays(D_array, fake_b = fake_b_d)
         if out_path is not None:
-            fa_f, md_f = self._get_fa_md(f_tensor)
-            fa_D_star, md_D_star = self._get_fa_md(D_star_tensor)
-            fa_D, md_D = self._get_fa_md(D_tensor)
+            fa_f, md_f = self.get_fa_md(f_tensor)
+            fa_D_star, md_D_star = self.get_fa_md(D_star_tensor)
+            fa_D, md_D = self.get_fa_md(D_tensor)
             np.savez(out_path, f_tensor=f_tensor, D_star_tensor=D_star_tensor, D_tensor=D_tensor, fa_f=fa_f, md_f=md_f, fa_D_star=fa_D_star, md_D_star=md_D_star, fa_D=fa_D, md_D=md_D)
             print(f"Saved fitted tensors to {out_path}")
         self.f_tensor = f_tensor
